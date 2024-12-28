@@ -258,8 +258,18 @@ impl Decoder {
                 }))
             }
             ChannelState::PayloadB { bytes } => {
+                let header = bytes[7];
+                let ba = (header >> 1) & 7;
+
+                let blen = match ba {
+                    4 => 10,
+                    2 => 100,
+                    7 => 0,
+                    _ => 40,
+                };
                 if let Some(b) = self.bits.peek_bits(blen + 1) {
                     self.bits.nth(blen);
+                    self.state = ChannelState::Header;
                     Ok(Some(Packet::A {
                         header,
                         tail: [bytes[2], bytes[3], bytes[4], bytes[5], bytes[6]],
@@ -268,7 +278,7 @@ impl Decoder {
                     }))
                 } else {
                     // We need more data
-                    return Ok(None);
+                    Ok(None)
                 }
             }
             ChannelState::Payload => {
