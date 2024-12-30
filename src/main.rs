@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::Result;
 
-use bitvec::{order::Msb0, vec::BitVec, view::AsBits};
+use bitvec::{field::BitField, order::Msb0, vec::BitVec, view::AsBits};
 use tokio::net::UdpSocket;
 
 const FP_SYNC: u32 = 0xAAE98A;
@@ -50,25 +50,6 @@ impl Rcrc for [u8; 8] {
         crc ^= 1;
         crc
     }
-}
-
-#[derive(Debug)]
-enum Packet {
-    Header {
-        rxmode: u8,
-        channel: u8,
-        slot: u16,
-        frameno: u8,
-        rssi: u8,
-        preamble: [u8; 3],
-        sync: u16,
-    },
-    A {
-        header: u8,
-        tail: [u8; 5],
-        crc: u16,
-        b: Option<BitVec<u8, Msb0>>,
-    },
 }
 
 /// Rolling bit iterator that yields the last 8 bytes.
@@ -216,11 +197,130 @@ const DUMMY_DATA: &[u8] = &[
     181, 214,
 ];
 
+// 7.1 https://www.etsi.org/deliver/etsi_en/300100_300199/30017503/02.08.01_60/en_30017503v020801p.pdf
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+enum TailIdentificationRFP {
+    CtDataPktNum0              = 0b000,
+    CtDataPktNum1              = 0b001,
+    NtIdentitiesInfoBearer     = 0b010,
+    NtIdentitiesInfo           = 0b011,
+    QtMultiFrameSyncAndSysInfo = 0b100,
+    CombinedCoding             = 0b101,
+    MtMACLayerControl          = 0b110,
+    MtPagingTail               = 0b111,
+}
+
+impl From<u8> for TailIdentificationRFP {
+    fn from(ident: u8) -> Self {
+        if ident > TailIdentificationRFP::MtPagingTail as u8 {
+            panic!("Invalid TA value")
+        }
+        unsafe { core::mem::transmute(ident) }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+enum TailIdentificationPP {
+    CtDataPktNum0              = 0b000,
+    CtDataPktNum1              = 0b001,
+    NtULE                      = 0b010,
+    NtIdentitiesInfo           = 0b011,
+    QtMultiFrameSyncAndSysInfo = 0b100,
+    CombinedCoding             = 0b101,
+    MtMACLayerControl          = 0b110,
+    MtFirstPPTransmission      = 0b111,
+}
+
+impl From<u8> for TailIdentificationPP {
+    fn from(ident: u8) -> Self {
+        if ident > TailIdentificationPP::MtFirstPPTransmission as u8 {
+            panic!("Invalid TA value")
+        }
+        unsafe { core::mem::transmute(ident) }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+enum BFieldIdentification {
+    NoValidErrorDetectChanData = 0b000, // CHANGEME
+    NoValidINChannelData       = 0b001, // CHANGEME
+    DoubleSlotRequired         = 0b010,
+    NotAllCLFPacketNum1        = 0b011, // CHANGEME
+    HalfSlotRequired           = 0b100,
+    LongSlotRequiredJ640       = 0b101,
+    LongSlotRequiredJ672       = 0b110,
+    NoSlotRequired             = 0b111, // CHANGEME
+    // NOTE: the combined coding of bits in TA have unique encodings.
+}
+
+impl From<u8> for BFieldIdentification {
+    fn from(ident: u8) -> Self {
+        if ident > BFieldIdentification::NoSlotRequired as u8 {
+            panic!("invalid BA value")
+        }
+        unsafe { core::mem::transmute(ident) }
+    }
+}
+
 #[derive(Debug, Clone)]
-enum ChannelState {
-    Header,
-    Payload,
-    PayloadB { bytes: [u8; 8] },
+enum TailIdentification {
+    RFP(TailIdentificationRFP),
+    PP(TailIdentificationPP),
+}
+
+#[derive(Debug, Clone)]
+struct MACHeader {
+    tail_ident:    TailIdentification,
+    q1_bck_bit:    bool,
+    b_field_ident: BFieldIdentification,
+    q2_bit:        bool,
+}
+
+#[derive(Debug, Clone)]
+struct MACPacket {
+    header:  MACHeader,
+    tail:    [u8; 5],
+    b_field: Option<BitVec<u8, Msb0>>,
+}
+
+// DECT defines four message types: N, Q, P, M
+#[derive(Debug, Copy, Clone)]
+struct NtIdentifiesInfo(u64);
+#[derive(Debug, Copy, Clone)]
+struct QtMultiFrameAndSysInfo(u64);
+#[derive(Debug, Copy, Clone)]
+struct PtPagingTail(u64);
+#[derive(Debug, Copy, Clone)]
+struct MtMACControl(u64);
+
+#[derive(Debug, Clone)]
+#[repr(u64)]
+enum TailMessage {
+    Nt(NtIdentifiesInfo),
+    Qt(QtMultiFrameAndSysInfo),
+    Pt(PtPagingTail),
+    Mt(MtMACControl),
+}
+
+// M message type parsing.
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+enum MtMACControlHeader {
+    BasicConnectionControl = 0b0000,
+    AdvConnectionControl   = 0b0001,
+    MACLayerTestMessages   = 0b0010,
+    QualityControl         = 0b0011,
+    BrdAndConnlessServices = 0b0100,
+    EncryptionControl      = 0b0101,
+    FirstBearerRequest     = 0b0110,
+    Escape                 = 0b0111,
+    TARIMessage            = 0b1000,
+    REPConnectionControl   = 0b1001,
+    AdvConnectionControl2  = 0b1010,
+    Reserved,
 }
 
 #[derive(Debug)]
@@ -229,107 +329,52 @@ struct Decoder {
     state: ChannelState,
 }
 
+#[derive(Debug, Clone)]
+enum ChannelState {
+    NewMessage,
+}
+
 impl Decoder {
-    pub async fn parse(&mut self) -> Result<Option<Packet>> {
+    pub async fn parse(&mut self) -> Result<Option<MACPacket>> {
         match self.state {
-            ChannelState::Header => {
+            ChannelState::NewMessage => {
                 let sync = self.bits.find(|n| {
                     (*n & 0xffffff) as u32 == FP_SYNC || (*n & 0xffffff) as u32 == PP_SYNC
                 });
-
-                let sync = match sync {
-                    Some(index) => index,
-                    None => return Ok(None),
-                };
-                println!("sync: {:016X}", sync);
-                self.state = ChannelState::Payload;
-                Ok(Some(Packet::Header {
-                    rxmode: 0,
-                    channel: 0,
-                    slot: 0,
-                    frameno: 0,
-                    rssi: 0,
-                    preamble: [
-                        (sync >> 40 & 0xff) as u8,
-                        (sync >> 32 & 0xff) as u8,
-                        (sync >> 24 & 0xff) as u8,
-                    ],
-                    sync: (sync as u16).to_be(),
-                }))
-            }
-            ChannelState::PayloadB { bytes } => {
-                let header = bytes[7];
-                let ba = (header >> 1) & 7;
-
-                let blen = match ba {
-                    4 => 10,
-                    2 => 100,
-                    7 => 0,
-                    _ => 40,
-                };
-                if let Some(b) = self.bits.peek_bits(blen + 1) {
-                    self.bits.nth(blen);
-                    self.state = ChannelState::Header;
-                    Ok(Some(Packet::A {
-                        header,
-                        tail: [bytes[2], bytes[3], bytes[4], bytes[5], bytes[6]],
-                        crc: (bytes[0] as u16) << 8 | bytes[1] as u16,
-                        b: Some(b),
-                    }))
-                } else {
-                    // We need more data
-                    Ok(None)
+                if sync.is_none() {
+                    return Ok(None);
                 }
-            }
-            ChannelState::Payload => {
+
+                // parse out header
                 let data = match self.bits.nth(63) {
                     Some(data) => data,
                     None => return Ok(None),
                 };
-
                 let bytes = data.to_be_bytes();
-
-                let crc = bytes.crc();
-                if crc != 0 {
-                    self.state = ChannelState::Header;
-                    return Ok(None);
-                }
-
                 let header = bytes[7];
+                let tail = [bytes[2], bytes[3], bytes[4], bytes[5], bytes[6]];
 
-                let ba = (header >> 1) & 7;
-
-                let blen = match ba {
-                    4 => 10,
-                    2 => 100,
-                    7 => 0,
-                    _ => 40,
+                let tail_ident    = TailIdentification::PP(TailIdentificationPP::from((header >> 5)));
+                let b_field_ident = BFieldIdentification::from((header >> 1) & 7);
+                let blen = match b_field_ident {
+                    BFieldIdentification::DoubleSlotRequired => 100,
+                    BFieldIdentification::HalfSlotRequired   => 10,
+                    BFieldIdentification::NoSlotRequired     => 0,
+                    _ => 40, // default B field size.
                 };
+                let b_field = self.bits.peek_bits(blen);
 
-                if blen > 0 {
-                    self.state = ChannelState::PayloadB { bytes };
-                    if let Some(b) = self.bits.peek_bits(blen + 1) {
-                        self.bits.nth(blen);
-                        Ok(Some(Packet::A {
-                            header,
-                            tail: [bytes[2], bytes[3], bytes[4], bytes[5], bytes[6]],
-                            crc: (bytes[0] as u16) << 8 | bytes[1] as u16,
-                            b: Some(b),
-                        }))
-                    } else {
-                        // We need more data
-                        return Ok(None);
-                    }
-                } else {
-                    self.state = ChannelState::Header;
-                    Ok(Some(Packet::A {
-                        header,
-                        tail: [bytes[2], bytes[3], bytes[4], bytes[5], bytes[6]],
-                        crc: (bytes[0] as u16) << 8 | bytes[1] as u16,
-                        b: None,
-                    }))
-                }
+                let header = MACHeader {
+                    tail_ident,
+                    q1_bck_bit: (header >> 4) & 1 == 1,
+                    b_field_ident,
+                    q2_bit: header & 1 == 1,
+                };
+                return Ok(Some(MACPacket {
+                    header, tail, b_field
+                }));
             }
+            _ => unimplemented!(),
         }
     }
 }
@@ -360,7 +405,7 @@ impl Channel {
 
             decoder: Decoder {
                 bits,
-                state: ChannelState::Header,
+                state: ChannelState::NewMessage,
             },
         })
     }
@@ -413,10 +458,13 @@ mod test {
     async fn test_decoder() {
         let mut decoder = Decoder {
             bits: BitIterator::new(DUMMY_DATA),
-            state: ChannelState::Header,
+            state: ChannelState::NewMessage,
         };
         decoder.extend(DUMMY_DATA.iter().copied());
         let packet = decoder.parse().await.unwrap();
         println!("{:?}", packet);
+        let packet = decoder.parse().await.unwrap();
+        let packet = decoder.parse().await.unwrap();
+
     }
 }
