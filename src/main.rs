@@ -1,126 +1,24 @@
-use std::{
-    io::Read,
-    net::{Ipv4Addr, SocketAddrV4},
-};
-
 use anyhow::Result;
 
-use bitvec::{field::BitField, order::Msb0, vec::BitVec, view::AsBits};
-use tokio::net::UdpSocket;
+use clap::{Parser, Subcommand};
 
-const FP_SYNC: u32 = 0xAAE98A;
-const PP_SYNC: u32 = 0x551675;
-const GP: u16 = 0x0589;
+mod capture;
+mod decode;
+mod dect;
 
-trait Rcrc {
-    fn crc(&self) -> u16;
+#[derive(Debug, Subcommand)]
+enum SubCommand {
+    Capture(capture::Args),
+    Decode(decode::Args),
 }
 
-impl Rcrc for [u8; 8] {
-    fn crc(&self) -> u16 {
-        let mut crc = ((self[0] as u16) << 8) | (self[1] as u16);
-        let mut next = 0;
-        let mut y = 0;
-        let mut x = 0;
-
-        while y < 6 {
-            next = self[2 + y];
-            y += 1;
-            x = 0;
-            while x < 8 {
-                while (crc & 0x8000) == 0 {
-                    crc <<= 1;
-                    crc |= if (next & 0x80) == 0 { 0 } else { 1 };
-                    next <<= 1;
-                    x += 1;
-                    if x > 7 {
-                        break;
-                    }
-                }
-                if x > 7 {
-                    break;
-                }
-                crc <<= 1;
-                crc |= if (next & 0x80) == 0 { 0 } else { 1 };
-                next <<= 1;
-                x += 1;
-                crc ^= GP;
-            }
-        }
-        crc ^= 1;
-        crc
-    }
+#[derive(Parser, Debug)]
+struct Args {
+    #[clap(subcommand)]
+    command: SubCommand,
 }
 
-/// Rolling bit iterator that yields the last 8 bytes.
-#[derive(Debug, Clone)]
-struct BitIterator {
-    inner: Vec<u8>,
-    bit: u8,
-    index: usize,
-}
-
-impl BitIterator {
-    fn new(inner: impl AsRef<[u8]>) -> Self {
-        Self {
-            inner: inner.as_ref().to_vec(),
-            bit: 7,
-            index: 0,
-        }
-    }
-}
-
-impl Extend<u8> for BitIterator {
-    fn extend<T: IntoIterator<Item = u8>>(&mut self, iter: T) {
-        self.inner.extend(iter);
-    }
-}
-
-impl BitIterator {
-    pub fn peek_bits(&mut self, n: usize) -> Option<BitVec<u8, Msb0>> {
-        let start = self.index * 8 + self.bit as usize;
-
-        let bits = &self.inner.as_bits::<Msb0>()[start..];
-        if bits.len() < n {
-            return None;
-        }
-
-        Some(bits[..n].to_bitvec())
-    }
-}
-
-impl Iterator for BitIterator {
-    type Item = u64;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let start = self.index * 8 + self.bit as usize;
-
-        if self.inner.as_bits::<Msb0>()[start..].len() < 64 {
-            return None;
-        }
-
-        let mut current = &self.inner.as_bits::<Msb0>()[start..start + 64];
-        let mut number = [0u8; 8];
-        current.read_exact(&mut number).ok()?;
-        let number = u64::from_be_bytes(number);
-
-        if self.bit == 0 {
-            self.bit = 7;
-            self.index += 1;
-        } else {
-            self.bit -= 1;
-        }
-
-        Some(number)
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-enum Dect {
-    Header,
-    Payload,
-}
-
+#[allow(dead_code)]
 const DUMMY_DATA: &[u8] = &[
     59, 41, 164, 181, 19, 51, 75, 178, 75, 106, 139, 40, 178, 139, 76, 166, 139, 9, 182, 122, 102,
     76, 177, 38, 236, 167, 154, 38, 204, 97, 136, 196, 105, 172, 201, 181, 82, 85, 44, 172, 51, 53,
@@ -197,244 +95,12 @@ const DUMMY_DATA: &[u8] = &[
     181, 214,
 ];
 
-// 7.1 https://www.etsi.org/deliver/etsi_en/300100_300199/30017503/02.08.01_60/en_30017503v020801p.pdf
-#[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-enum TailIdentificationRFP {
-    CtDataPktNum0              = 0b000,
-    CtDataPktNum1              = 0b001,
-    NtIdentitiesInfoBearer     = 0b010,
-    NtIdentitiesInfo           = 0b011,
-    QtMultiFrameSyncAndSysInfo = 0b100,
-    CombinedCoding             = 0b101,
-    MtMACLayerControl          = 0b110,
-    MtPagingTail               = 0b111,
-}
-
-impl From<u8> for TailIdentificationRFP {
-    fn from(ident: u8) -> Self {
-        if ident > TailIdentificationRFP::MtPagingTail as u8 {
-            panic!("Invalid TA value")
-        }
-        unsafe { core::mem::transmute(ident) }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-enum TailIdentificationPP {
-    CtDataPktNum0              = 0b000,
-    CtDataPktNum1              = 0b001,
-    NtULE                      = 0b010,
-    NtIdentitiesInfo           = 0b011,
-    QtMultiFrameSyncAndSysInfo = 0b100,
-    CombinedCoding             = 0b101,
-    MtMACLayerControl          = 0b110,
-    MtFirstPPTransmission      = 0b111,
-}
-
-impl From<u8> for TailIdentificationPP {
-    fn from(ident: u8) -> Self {
-        if ident > TailIdentificationPP::MtFirstPPTransmission as u8 {
-            panic!("Invalid TA value")
-        }
-        unsafe { core::mem::transmute(ident) }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-enum BFieldIdentification {
-    NoValidErrorDetectChanData = 0b000, // CHANGEME
-    NoValidINChannelData       = 0b001, // CHANGEME
-    DoubleSlotRequired         = 0b010,
-    NotAllCLFPacketNum1        = 0b011, // CHANGEME
-    HalfSlotRequired           = 0b100,
-    LongSlotRequiredJ640       = 0b101,
-    LongSlotRequiredJ672       = 0b110,
-    NoSlotRequired             = 0b111, // CHANGEME
-    // NOTE: the combined coding of bits in TA have unique encodings.
-}
-
-impl From<u8> for BFieldIdentification {
-    fn from(ident: u8) -> Self {
-        if ident > BFieldIdentification::NoSlotRequired as u8 {
-            panic!("invalid BA value")
-        }
-        unsafe { core::mem::transmute(ident) }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum TailIdentification {
-    RFP(TailIdentificationRFP),
-    PP(TailIdentificationPP),
-}
-
-#[derive(Debug, Clone)]
-struct MACHeader {
-    tail_ident:    TailIdentification,
-    q1_bck_bit:    bool,
-    b_field_ident: BFieldIdentification,
-    q2_bit:        bool,
-}
-
-#[derive(Debug, Clone)]
-struct MACPacket {
-    header:  MACHeader,
-    tail:    [u8; 5],
-    b_field: Option<BitVec<u8, Msb0>>,
-}
-
-// DECT defines four message types: N, Q, P, M
-#[derive(Debug, Copy, Clone)]
-struct NtIdentifiesInfo(u64);
-#[derive(Debug, Copy, Clone)]
-struct QtMultiFrameAndSysInfo(u64);
-#[derive(Debug, Copy, Clone)]
-struct PtPagingTail(u64);
-#[derive(Debug, Copy, Clone)]
-struct MtMACControl(u64);
-
-#[derive(Debug, Clone)]
-#[repr(u64)]
-enum TailMessage {
-    Nt(NtIdentifiesInfo),
-    Qt(QtMultiFrameAndSysInfo),
-    Pt(PtPagingTail),
-    Mt(MtMACControl),
-}
-
-// M message type parsing.
-#[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-enum MtMACControlHeader {
-    BasicConnectionControl = 0b0000,
-    AdvConnectionControl   = 0b0001,
-    MACLayerTestMessages   = 0b0010,
-    QualityControl         = 0b0011,
-    BrdAndConnlessServices = 0b0100,
-    EncryptionControl      = 0b0101,
-    FirstBearerRequest     = 0b0110,
-    Escape                 = 0b0111,
-    TARIMessage            = 0b1000,
-    REPConnectionControl   = 0b1001,
-    AdvConnectionControl2  = 0b1010,
-    Reserved,
-}
-
-#[derive(Debug)]
-struct Decoder {
-    bits: BitIterator,
-    state: ChannelState,
-}
-
-#[derive(Debug, Clone)]
-enum ChannelState {
-    NewMessage,
-}
-
-impl Decoder {
-    pub async fn parse(&mut self) -> Result<Option<MACPacket>> {
-        match self.state {
-            ChannelState::NewMessage => {
-                let sync = self.bits.find(|n| {
-                    (*n & 0xffffff) as u32 == FP_SYNC || (*n & 0xffffff) as u32 == PP_SYNC
-                });
-                if sync.is_none() {
-                    return Ok(None);
-                }
-
-                // parse out header
-                let data = match self.bits.nth(63) {
-                    Some(data) => data,
-                    None => return Ok(None),
-                };
-                let bytes = data.to_be_bytes();
-                let header = bytes[7];
-                let tail = [bytes[2], bytes[3], bytes[4], bytes[5], bytes[6]];
-
-                let tail_ident    = TailIdentification::PP(TailIdentificationPP::from((header >> 5)));
-                let b_field_ident = BFieldIdentification::from((header >> 1) & 7);
-                let blen = match b_field_ident {
-                    BFieldIdentification::DoubleSlotRequired => 100,
-                    BFieldIdentification::HalfSlotRequired   => 10,
-                    BFieldIdentification::NoSlotRequired     => 0,
-                    _ => 40, // default B field size.
-                };
-                let b_field = self.bits.peek_bits(blen);
-
-                let header = MACHeader {
-                    tail_ident,
-                    q1_bck_bit: (header >> 4) & 1 == 1,
-                    b_field_ident,
-                    q2_bit: header & 1 == 1,
-                };
-                return Ok(Some(MACPacket {
-                    header, tail, b_field
-                }));
-            }
-            _ => unimplemented!(),
-        }
-    }
-}
-
-impl Extend<u8> for Decoder {
-    fn extend<T: IntoIterator<Item = u8>>(&mut self, iter: T) {
-        self.bits.extend(iter);
-    }
-}
-
-#[derive(Debug)]
-struct Channel {
-    socket: UdpSocket,
-
-    decoder: Decoder,
-}
-
-impl Channel {
-    pub async fn new(port: u16, index: usize) -> Result<Self> {
-        let addr = Ipv4Addr::new(0, 0, 0, 0);
-        let addr = SocketAddrV4::new(addr, port);
-
-        let socket = UdpSocket::bind(addr).await?;
-
-        let bits = BitIterator::new([]);
-        Ok(Self {
-            socket,
-
-            decoder: Decoder {
-                bits,
-                state: ChannelState::NewMessage,
-            },
-        })
-    }
-
-    pub async fn recv(&mut self) -> Result<()> {
-        let mut buf = [0u8; 2048];
-        let size = self.socket.recv(&mut buf).await?;
-        if size > 0 {
-            self.decoder.extend(buf[..size].iter().copied());
-        }
-
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    //let mut channel = Channel::new(2323).await?;
-
-    let mut channel = Channel::new(2323, 0).await?;
-    channel.recv().await?;
-
-    while let Ok(packet) = channel.decoder.parse().await {
-        match packet {
-            Some(packet) => println!("{:?}", packet),
-            None => {
-                channel.recv().await?;
-            }
-        }
+    let args = Args::parse();
+    match args.command {
+        SubCommand::Capture(args) => capture::run(args).await?,
+        SubCommand::Decode(args) => decode::run(args).await?,
     }
 
     Ok(())
@@ -443,28 +109,18 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod test {
 
-    use crate::{BitIterator, ChannelState, Decoder, DUMMY_DATA};
+    use crate::{
+        decode::{BitIterator, ChannelState, Decoder},
+        dect::{FP_SYNC, PP_SYNC},
+        DUMMY_DATA,
+    };
 
     #[test]
     fn test_bit_iterator() {
-        let iter = super::BitIterator::new(super::DUMMY_DATA);
+        let iter = BitIterator::new(super::DUMMY_DATA);
 
         assert!(iter
             .map(|n| (n & 0xffffff) as u32)
-            .any(|n| n == super::FP_SYNC || n == super::PP_SYNC));
-    }
-
-    #[tokio::test]
-    async fn test_decoder() {
-        let mut decoder = Decoder {
-            bits: BitIterator::new(DUMMY_DATA),
-            state: ChannelState::NewMessage,
-        };
-        decoder.extend(DUMMY_DATA.iter().copied());
-        let packet = decoder.parse().await.unwrap();
-        println!("{:?}", packet);
-        let packet = decoder.parse().await.unwrap();
-        let packet = decoder.parse().await.unwrap();
-
+            .any(|n| n == FP_SYNC || n == PP_SYNC));
     }
 }
