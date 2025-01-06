@@ -97,6 +97,11 @@ const DUMMY_DATA: &[u8] = &[
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        // sets this to be the default, global collector for this application.
+        .init();
+
     let args = Args::parse();
     match args.command {
         SubCommand::Capture(args) => capture::run(args).await?,
@@ -110,9 +115,8 @@ async fn main() -> Result<()> {
 mod test {
 
     use crate::{
-        decode::{BitIterator, ChannelState, Decoder},
+        decode::BitIterator,
         dect::{FP_SYNC, PP_SYNC},
-        DUMMY_DATA,
     };
 
     #[test]

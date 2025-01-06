@@ -139,6 +139,22 @@ pub struct MACPacket {
     pub b_field: Option<BitVec<u8, Msb0>>,
 }
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum MacBody {
+    MtMacControl(MtMacControl),
+    Escape(BitVec<u8, Msb0>),
+    QualityControl(MtQualityControl),
+    Empty,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct L2MACPacket {
+    pub header: MACHeader,
+    pub payload: Option<MacBody>,
+}
+
 // DECT defines four message types: N, Q, P, M
 #[derive(Debug, Copy, Clone)]
 #[allow(dead_code)]
@@ -180,4 +196,99 @@ pub enum MtMACControlHeader {
     REPConnectionControl = 0b1001,
     AdvConnectionControl2 = 0b1010,
     Reserved,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+#[allow(dead_code)]
+pub enum MtBasicConnectionControlCommand {
+    AccessRequest = 0b0000,
+    BearerHandoverRequest = 0b0001,
+    BearerHandoverConfirm = 0b0010,
+    UnconfirmedAccessRequest = 0b0011,
+    BearerConfirm = 0b0100,
+    Wait = 0b0101,
+    AttributesTRequest = 0b0110,
+    AttributesTConfirm = 0b0111,
+    Reserved,
+    Release = 0b1111,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+#[allow(dead_code)]
+pub enum MtAdvConnectionControlCommand {
+    AccessRequest = 0b0000,
+    BearerHandoverRequest = 0b0001,
+    BearerHandoverConfirm = 0b0010,
+    UnconfirmedAccessRequest = 0b0011,
+    BearerConfirm = 0b0100,
+    Wait = 0b0101,
+    AttributesTRequest = 0b0110,
+    AttributesTConfirm = 0b0111,
+    BandwidthTRequest = 0b1000,
+    BandwidthTConfirm = 0b1001,
+    ChannelList = 0b1010,
+    UnconfirmedDummy = 0b1011,
+    UnconfirmedHandover = 0b1100,
+    Reserved = 0b1101,
+    Reserved2 = 0b1110,
+    Release = 0b1111,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct MtQualityControl {
+    pub command: u8,
+    pub param_1: u8,
+    pub param_2: u8,
+    pub check: u16,
+}
+
+impl From<u8> for MtAdvConnectionControlCommand {
+    fn from(ident: u8) -> Self {
+        unsafe { core::mem::transmute::<u8, Self>(ident & 0b1111) }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub enum MtMacControl {
+    BasicConnectionControl(MtBasicConnectionControl),
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct MtFirstPPTransmission {
+    pub fmid: u16,
+    pub pmid: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub enum MtBasicConnectionControl {
+    AccessRequest(MtFirstPPTransmission),
+}
+
+impl From<u8> for MtBasicConnectionControlCommand {
+    fn from(ident: u8) -> Self {
+        let ident = ident & 0b1111;
+        if ident >= MtMACControlHeader::Reserved as u8
+            && ident < MtBasicConnectionControlCommand::Release as u8
+        {
+            MtBasicConnectionControlCommand::Reserved
+        } else {
+            unsafe { core::mem::transmute::<u8, Self>(ident) }
+        }
+    }
+}
+
+impl From<u8> for MtMACControlHeader {
+    fn from(ident: u8) -> Self {
+        if ident & 0b1111 >= MtMACControlHeader::Reserved as u8 {
+            MtMACControlHeader::Reserved
+        } else {
+            unsafe { core::mem::transmute::<u8, Self>(ident) }
+        }
+    }
 }

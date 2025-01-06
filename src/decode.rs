@@ -1,15 +1,23 @@
 use crate::capture::DataSource;
 use crate::capture::FileChannel;
+use crate::dect::L2MACPacket;
+use crate::dect::MacBody;
+use crate::dect::MtAdvConnectionControlCommand;
+use crate::dect::MtBasicConnectionControl;
+use crate::dect::MtBasicConnectionControlCommand;
+use crate::dect::MtFirstPPTransmission;
+use crate::dect::MtMACControlHeader;
+use crate::dect::MtMacControl;
+use crate::dect::MtQualityControl;
 use crate::dect::Rcrc;
+use crate::dect::TailIdentification;
 
 use anyhow::Result;
+use bitvec::field::BitField;
 use bitvec::{order::Msb0, vec::BitVec, view::AsBits};
 use std::{io::Read, path::PathBuf};
 
-use crate::dect::{
-    BFieldIdentification, MACHeader, MACPacket, TailIdentification, TailIdentificationPP, FP_SYNC,
-    PP_SYNC,
-};
+use crate::dect::{BFieldIdentification, MACHeader, TailIdentificationPP, FP_SYNC, PP_SYNC};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -57,6 +65,13 @@ impl BitIterator {
         }
 
         Some(bits[..n].to_bitvec())
+    }
+
+    pub fn advance(&mut self, bits: usize) {
+        let n = (bits / 8) + self.bit as usize;
+
+        self.index += n / 8;
+        self.bit = (n % 8) as u8;
     }
 }
 
@@ -108,15 +123,15 @@ pub enum ChannelState {
 
 #[derive(Debug, Copy, Clone)]
 pub enum Sync {
-    Fp(u64),
-    Pp(u64),
+    Fp,
+    Pp,
 }
 
 #[derive(Clone, Debug)]
-enum DecoderState {
+pub enum DecoderState {
     MoreData,
     Partial,
-    Full(MACPacket),
+    Full(L2MACPacket),
 }
 
 impl Decoder {
@@ -128,21 +143,20 @@ impl Decoder {
                     return Ok(DecoderState::MoreData);
                 }
 
-                let sync = self.bits.find(|n| {
-                    (*n & 0xffffff) as u32 == FP_SYNC || (*n & 0xffffff) as u32 == PP_SYNC
-                });
+                let sync = self
+                    .bits
+                    .find(|n| {
+                        (*n & 0xffffff) as u32 == FP_SYNC || (*n & 0xffffff) as u32 == PP_SYNC
+                    })
+                    .map(|n| (n & 0xFFFFFF) as u32);
 
                 match sync {
                     None => return Ok(DecoderState::MoreData),
-                    Some(sync) if (sync & 0xffffff) as u32 == FP_SYNC => {
-                        self.state = ChannelState::AField {
-                            sync: Sync::Fp(sync),
-                        };
+                    Some(FP_SYNC) => {
+                        self.state = ChannelState::AField { sync: Sync::Fp };
                     }
-                    Some(sync) if (sync & 0xffffff) as u32 == PP_SYNC => {
-                        self.state = ChannelState::AField {
-                            sync: Sync::Pp(sync),
-                        };
+                    Some(PP_SYNC) => {
+                        self.state = ChannelState::AField { sync: Sync::Pp };
                     }
                     Some(_) => unreachable!(),
                 }
@@ -162,7 +176,6 @@ impl Decoder {
                 let bytes = data.to_be_bytes();
 
                 if bytes.crc() != 0 {
-                    println!("CRC error!");
                     self.state = ChannelState::NewMessage;
                     return Ok(DecoderState::Partial);
                 }
@@ -171,13 +184,19 @@ impl Decoder {
                 let tail = [bytes[2], bytes[3], bytes[4], bytes[5], bytes[6]];
 
                 let tail_ident = TailIdentification::Pp(TailIdentificationPP::from(header >> 5));
-                let b_field_ident = BFieldIdentification::from((header >> 1) & 7);
-                let blen = match b_field_ident {
+                let b_field_ident = BFieldIdentification::from((header >> 1) & 0b111);
+                // Length of B field in bits.
+                let mut blen = match b_field_ident {
                     BFieldIdentification::DoubleSlotRequired => 100,
                     BFieldIdentification::HalfSlotRequired => 10,
                     BFieldIdentification::NoSlotRequired => 0,
                     _ => 40, // default B field size.
                 };
+
+                if blen != 0 {
+                    // 4 bits for X-field and 4 bits for Z-field
+                    blen += 1;
+                }
 
                 let header = MACHeader {
                     tail_ident,
@@ -213,19 +232,110 @@ impl Decoder {
                         .bits
                         .peek_bits(length)
                         .expect("Out of bounds despite check!");
-                    self.bits
-                        .nth(length - 1)
-                        .expect("Out of bounds despite check!");
+                    self.bits.advance(length);
                     Some(b_field)
                 };
+                let payload = if let Some(b_field) = &b_field {
+                    match &header.tail_ident {
+                        TailIdentification::Pp(TailIdentificationPP::MtMACLayerControl) => {
+                            let m_t_bits = &b_field[..4];
+                            let m_t_header = MtMACControlHeader::from(m_t_bits.load_be::<u8>());
 
+                            match &m_t_header {
+                                MtMACControlHeader::QualityControl => {
+                                    let command_bits = &b_field[4..8];
+                                    let param_1_bits = &b_field[8..16];
+                                    let param_2_bits = &b_field[16..24];
+                                    let check_bits = &b_field[24..40];
+
+                                    let command = MtQualityControl {
+                                        command: command_bits.load_be::<u8>(),
+                                        param_1: param_1_bits.load_be::<u8>(),
+                                        param_2: param_2_bits.load_be::<u8>(),
+                                        check: check_bits.load_be::<u16>(),
+                                    };
+
+                                    tracing::info!(
+                                        "{:?} {:04b}:{:04b}:{:04b}:{:04b}{:016b}",
+                                        m_t_header,
+                                        m_t_bits.load_be::<u8>(),
+                                        command.command,
+                                        command.param_1,
+                                        command.param_2,
+                                        command.check
+                                    );
+
+                                    Some(MacBody::QualityControl(command))
+                                }
+                                MtMACControlHeader::Escape => {
+                                    let bits = b_field[4..40].to_bitvec();
+
+                                    Some(MacBody::Escape(bits))
+                                }
+                                MtMACControlHeader::AdvConnectionControl => {
+                                    let bits = &b_field[4..8];
+                                    let header =
+                                        MtAdvConnectionControlCommand::from(bits.load_be::<u8>());
+
+                                    tracing::info!(
+                                        "{:?} {:04b}:{:04b}",
+                                        m_t_header,
+                                        m_t_bits.load_be::<u8>(),
+                                        bits.load_be::<u8>()
+                                    );
+
+                                    None
+                                }
+                                MtMACControlHeader::BasicConnectionControl => {
+                                    let bits = &b_field[4..8];
+                                    let header =
+                                        MtBasicConnectionControlCommand::from(bits.load_be::<u8>());
+
+                                    tracing::info!(
+                                        "{:?} {:04b}:{:04b}",
+                                        m_t_header,
+                                        m_t_bits.load_be::<u8>(),
+                                        bits.load_be::<u8>()
+                                    );
+
+                                    match &header {
+                                        MtBasicConnectionControlCommand::AccessRequest => {
+                                            let fmid_bits = &b_field[8..20];
+                                            let pmid_bits = &b_field[20..40];
+                                            let first_pp_transmission = MtFirstPPTransmission {
+                                                fmid: fmid_bits.load_be::<u16>(),
+                                                pmid: pmid_bits.load_be::<u32>(),
+                                            };
+
+                                            tracing::info!(
+                                                "Access Request: {:08x} => {:08x}",
+                                                first_pp_transmission.fmid,
+                                                first_pp_transmission.pmid
+                                            );
+
+                                            Some(MacBody::MtMacControl(
+                                                MtMacControl::BasicConnectionControl(
+                                                    MtBasicConnectionControl::AccessRequest(
+                                                        first_pp_transmission,
+                                                    ),
+                                                ),
+                                            ))
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            }
+                        }
+
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 self.state = ChannelState::NewMessage;
 
-                Ok(DecoderState::Full(MACPacket {
-                    header,
-                    tail,
-                    b_field,
-                }))
+                Ok(DecoderState::Full(L2MACPacket { header, payload }))
             }
         }
     }
@@ -252,7 +362,7 @@ pub async fn run(args: Args) -> Result<()> {
                 decoder.extend(buf);
             }
             DecoderState::Partial => continue,
-            DecoderState::Full(macpacket) => println!("{:?}", macpacket),
+            DecoderState::Full(macpacket) => {}
         }
     }
 
