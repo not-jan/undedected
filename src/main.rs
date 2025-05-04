@@ -1,145 +1,24 @@
-use std::{
-    io::Read,
-    net::{Ipv4Addr, SocketAddrV4},
-};
-
 use anyhow::Result;
 
-use bitvec::{order::Msb0, vec::BitVec, view::AsBits};
-use tokio::net::UdpSocket;
+use clap::{Parser, Subcommand};
 
-const FP_SYNC: u32 = 0xAAE98A;
-const PP_SYNC: u32 = 0x551675;
-const GP: u16 = 0x0589;
+mod capture;
+mod decode;
+mod dect;
 
-trait Rcrc {
-    fn crc(&self) -> u16;
+#[derive(Debug, Subcommand)]
+enum SubCommand {
+    Capture(capture::Args),
+    Decode(decode::Args),
 }
 
-impl Rcrc for [u8; 8] {
-    fn crc(&self) -> u16 {
-        let mut crc = ((self[0] as u16) << 8) | (self[1] as u16);
-        let mut next = 0;
-        let mut y = 0;
-        let mut x = 0;
-
-        while y < 6 {
-            next = self[2 + y];
-            y += 1;
-            x = 0;
-            while x < 8 {
-                while (crc & 0x8000) == 0 {
-                    crc <<= 1;
-                    crc |= if (next & 0x80) == 0 { 0 } else { 1 };
-                    next <<= 1;
-                    x += 1;
-                    if x > 7 {
-                        break;
-                    }
-                }
-                if x > 7 {
-                    break;
-                }
-                crc <<= 1;
-                crc |= if (next & 0x80) == 0 { 0 } else { 1 };
-                next <<= 1;
-                x += 1;
-                crc ^= GP;
-            }
-        }
-        crc ^= 1;
-        crc
-    }
+#[derive(Parser, Debug)]
+struct Args {
+    #[clap(subcommand)]
+    command: SubCommand,
 }
 
-#[derive(Debug)]
-enum Packet {
-    Header {
-        rxmode: u8,
-        channel: u8,
-        slot: u16,
-        frameno: u8,
-        rssi: u8,
-        preamble: [u8; 3],
-        sync: u16,
-    },
-    A {
-        header: u8,
-        tail: [u8; 5],
-        crc: u16,
-        b: Option<BitVec<u8, Msb0>>,
-    },
-}
-
-/// Rolling bit iterator that yields the last 8 bytes.
-#[derive(Debug, Clone)]
-struct BitIterator {
-    inner: Vec<u8>,
-    bit: u8,
-    index: usize,
-}
-
-impl BitIterator {
-    fn new(inner: impl AsRef<[u8]>) -> Self {
-        Self {
-            inner: inner.as_ref().to_vec(),
-            bit: 7,
-            index: 0,
-        }
-    }
-}
-
-impl Extend<u8> for BitIterator {
-    fn extend<T: IntoIterator<Item = u8>>(&mut self, iter: T) {
-        self.inner.extend(iter);
-    }
-}
-
-impl BitIterator {
-    pub fn peek_bits(&mut self, n: usize) -> Option<BitVec<u8, Msb0>> {
-        let start = self.index * 8 + self.bit as usize;
-
-        let bits = &self.inner.as_bits::<Msb0>()[start..];
-        if bits.len() < n {
-            return None;
-        }
-
-        Some(bits[..n].to_bitvec())
-    }
-}
-
-impl Iterator for BitIterator {
-    type Item = u64;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let start = self.index * 8 + self.bit as usize;
-
-        if self.inner.as_bits::<Msb0>()[start..].len() < 64 {
-            return None;
-        }
-
-        let mut current = &self.inner.as_bits::<Msb0>()[start..start + 64];
-        let mut number = [0u8; 8];
-        current.read_exact(&mut number).ok()?;
-        let number = u64::from_be_bytes(number);
-
-        if self.bit == 0 {
-            self.bit = 7;
-            self.index += 1;
-        } else {
-            self.bit -= 1;
-        }
-
-        Some(number)
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-enum Dect {
-    Header,
-    Payload,
-}
-
+#[allow(dead_code)]
 const DUMMY_DATA: &[u8] = &[
     59, 41, 164, 181, 19, 51, 75, 178, 75, 106, 139, 40, 178, 139, 76, 166, 139, 9, 182, 122, 102,
     76, 177, 38, 236, 167, 154, 38, 204, 97, 136, 196, 105, 172, 201, 181, 82, 85, 44, 172, 51, 53,
@@ -216,180 +95,17 @@ const DUMMY_DATA: &[u8] = &[
     181, 214,
 ];
 
-#[derive(Debug, Clone)]
-enum ChannelState {
-    Header,
-    Payload,
-    PayloadB { bytes: [u8; 8] },
-}
-
-#[derive(Debug)]
-struct Decoder {
-    bits: BitIterator,
-    state: ChannelState,
-}
-
-impl Decoder {
-    pub async fn parse(&mut self) -> Result<Option<Packet>> {
-        match self.state {
-            ChannelState::Header => {
-                let sync = self.bits.find(|n| {
-                    (*n & 0xffffff) as u32 == FP_SYNC || (*n & 0xffffff) as u32 == PP_SYNC
-                });
-
-                let sync = match sync {
-                    Some(index) => index,
-                    None => return Ok(None),
-                };
-                println!("sync: {:016X}", sync);
-                self.state = ChannelState::Payload;
-                Ok(Some(Packet::Header {
-                    rxmode: 0,
-                    channel: 0,
-                    slot: 0,
-                    frameno: 0,
-                    rssi: 0,
-                    preamble: [
-                        (sync >> 40 & 0xff) as u8,
-                        (sync >> 32 & 0xff) as u8,
-                        (sync >> 24 & 0xff) as u8,
-                    ],
-                    sync: (sync as u16).to_be(),
-                }))
-            }
-            ChannelState::PayloadB { bytes } => {
-                let header = bytes[7];
-                let ba = (header >> 1) & 7;
-
-                let blen = match ba {
-                    4 => 10,
-                    2 => 100,
-                    7 => 0,
-                    _ => 40,
-                };
-                if let Some(b) = self.bits.peek_bits(blen + 1) {
-                    self.bits.nth(blen);
-                    self.state = ChannelState::Header;
-                    Ok(Some(Packet::A {
-                        header,
-                        tail: [bytes[2], bytes[3], bytes[4], bytes[5], bytes[6]],
-                        crc: (bytes[0] as u16) << 8 | bytes[1] as u16,
-                        b: Some(b),
-                    }))
-                } else {
-                    // We need more data
-                    Ok(None)
-                }
-            }
-            ChannelState::Payload => {
-                let data = match self.bits.nth(63) {
-                    Some(data) => data,
-                    None => return Ok(None),
-                };
-
-                let bytes = data.to_be_bytes();
-
-                let crc = bytes.crc();
-                if crc != 0 {
-                    self.state = ChannelState::Header;
-                    return Ok(None);
-                }
-
-                let header = bytes[7];
-
-                let ba = (header >> 1) & 7;
-
-                let blen = match ba {
-                    4 => 10,
-                    2 => 100,
-                    7 => 0,
-                    _ => 40,
-                };
-
-                if blen > 0 {
-                    self.state = ChannelState::PayloadB { bytes };
-                    if let Some(b) = self.bits.peek_bits(blen + 1) {
-                        self.bits.nth(blen);
-                        Ok(Some(Packet::A {
-                            header,
-                            tail: [bytes[2], bytes[3], bytes[4], bytes[5], bytes[6]],
-                            crc: (bytes[0] as u16) << 8 | bytes[1] as u16,
-                            b: Some(b),
-                        }))
-                    } else {
-                        // We need more data
-                        return Ok(None);
-                    }
-                } else {
-                    self.state = ChannelState::Header;
-                    Ok(Some(Packet::A {
-                        header,
-                        tail: [bytes[2], bytes[3], bytes[4], bytes[5], bytes[6]],
-                        crc: (bytes[0] as u16) << 8 | bytes[1] as u16,
-                        b: None,
-                    }))
-                }
-            }
-        }
-    }
-}
-
-impl Extend<u8> for Decoder {
-    fn extend<T: IntoIterator<Item = u8>>(&mut self, iter: T) {
-        self.bits.extend(iter);
-    }
-}
-
-#[derive(Debug)]
-struct Channel {
-    socket: UdpSocket,
-
-    decoder: Decoder,
-}
-
-impl Channel {
-    pub async fn new(port: u16, index: usize) -> Result<Self> {
-        let addr = Ipv4Addr::new(0, 0, 0, 0);
-        let addr = SocketAddrV4::new(addr, port);
-
-        let socket = UdpSocket::bind(addr).await?;
-
-        let bits = BitIterator::new([]);
-        Ok(Self {
-            socket,
-
-            decoder: Decoder {
-                bits,
-                state: ChannelState::Header,
-            },
-        })
-    }
-
-    pub async fn recv(&mut self) -> Result<()> {
-        let mut buf = [0u8; 2048];
-        let size = self.socket.recv(&mut buf).await?;
-        if size > 0 {
-            self.decoder.extend(buf[..size].iter().copied());
-        }
-
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    //let mut channel = Channel::new(2323).await?;
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        // sets this to be the default, global collector for this application.
+        .init();
 
-    let mut channel = Channel::new(2323, 0).await?;
-    channel.recv().await?;
-
-    while let Ok(packet) = channel.decoder.parse().await {
-        match packet {
-            Some(packet) => println!("{:?}", packet),
-            None => {
-                channel.recv().await?;
-            }
-        }
+    let args = Args::parse();
+    match args.command {
+        SubCommand::Capture(args) => capture::run(args).await?,
+        SubCommand::Decode(args) => decode::run(args).await?,
     }
 
     Ok(())
@@ -398,25 +114,17 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod test {
 
-    use crate::{BitIterator, ChannelState, Decoder, DUMMY_DATA};
+    use crate::{
+        decode::BitIterator,
+        dect::{FP_SYNC, PP_SYNC},
+    };
 
     #[test]
     fn test_bit_iterator() {
-        let iter = super::BitIterator::new(super::DUMMY_DATA);
+        let iter = BitIterator::new(super::DUMMY_DATA);
 
         assert!(iter
             .map(|n| (n & 0xffffff) as u32)
-            .any(|n| n == super::FP_SYNC || n == super::PP_SYNC));
-    }
-
-    #[tokio::test]
-    async fn test_decoder() {
-        let mut decoder = Decoder {
-            bits: BitIterator::new(DUMMY_DATA),
-            state: ChannelState::Header,
-        };
-        decoder.extend(DUMMY_DATA.iter().copied());
-        let packet = decoder.parse().await.unwrap();
-        println!("{:?}", packet);
+            .any(|n| n == FP_SYNC || n == PP_SYNC));
     }
 }
